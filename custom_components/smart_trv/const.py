@@ -57,6 +57,8 @@ DEFAULT_FF_OUTDOOR_DEADBAND_K = 0.5       # ignore ±0.5 K around zero delta
 # Valve control constants
 VALVE_OPEN_POSITION = 255
 VALVE_CLOSED_POSITION = 0
+# Enforce a minimum step size when commanding the valve to reduce chattering
+VALVE_MIN_STEP = 5
 
 # Minimum interval between issuing valve updates to underlying TRVs (seconds)
 # Requirement: update valve position only on demand or max once per minute.

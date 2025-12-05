@@ -21,8 +21,9 @@ from .const import (ATTR_ROOM_TEMPERATURE, ATTR_TRV_ENTITIES, ATTR_VALVE_POSITIO
                     CONF_FF_ENABLE_SMOOTHING, CONF_FF_FLOW_FILTER_TAU_S, CONF_FF_OUTDOOR_FILTER_TAU_S, CONF_FF_FLOW_DEADBAND_K, CONF_FF_OUTDOOR_DEADBAND_K,
                     DEFAULT_FF_ENABLE_SMOOTHING, DEFAULT_FF_FLOW_FILTER_TAU_S, DEFAULT_FF_OUTDOOR_FILTER_TAU_S, DEFAULT_FF_FLOW_DEADBAND_K,
                     DEFAULT_FF_OUTDOOR_DEADBAND_K, DEFAULT_MAX_TEMP, DEFAULT_MIN_TEMP, DEFAULT_PRECISION, DEFAULT_TARGET_TEMP, DOMAIN, VALVE_CLOSED_POSITION,
-                    VALVE_OPEN_POSITION, VALVE_UPDATE_MIN_INTERVAL_S,  # IMC additions
-                    CONF_IMC_PROCESS_GAIN, CONF_IMC_DEAD_TIME, CONF_IMC_TIME_CONSTANT, CONF_IMC_LAMBDA,  # Diagnostics
+                    VALVE_OPEN_POSITION, VALVE_MIN_STEP, VALVE_UPDATE_MIN_INTERVAL_S,  # IMC additions
+                    CONF_IMC_PROCESS_GAIN, CONF_IMC_DEAD_TIME, CONF_IMC_TIME_CONSTANT, CONF_IMC_LAMBDA,
+                    DEFAULT_IMC_PROCESS_GAIN, DEFAULT_IMC_DEAD_TIME, DEFAULT_IMC_TIME_CONSTANT, DEFAULT_IMC_LAMBDA,  # Diagnostics and defaults
                     ATTR_DESIRED_VALVE_POSITION, ATTR_ERROR_C, ATTR_ERROR_NORM, ATTR_U_PI, ATTR_U_I, ATTR_U_FF, ATTR_U_TOTAL, ATTR_FLOW_FILTERED,
                     ATTR_OUTDOOR_FILTERED, ATTR_IMC_KC, ATTR_IMC_KI, ATTR_WINDOW_OPEN, ATTR_ACTUAL_VALVE_POSITION,  # Steady-state defaults and other defaults
                     DEFAULT_STEADY_DEADBAND_C, DEFAULT_DECAY_TAU_S, DEFAULT_NAME, MIN_TEMP_RANGE_C, WINDOW_CHECK_MIN_INTERVAL_S, DEFAULT_BOOST_DURATION_S,
@@ -95,12 +96,12 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
         self._last_window_check_time: float | None = None
         self._window_open_until: float | None = None
 
-        # Compute IMC gains unconditionally; parameters must be valid
-        kp_proc = float(config.get(CONF_IMC_PROCESS_GAIN))
-        tau = float(config.get(CONF_IMC_TIME_CONSTANT))
-        theta = float(config.get(CONF_IMC_DEAD_TIME, 0.0) or 0.0)
+        # Compute IMC gains unconditionally; fall back to sensible defaults
+        kp_proc = float(config.get(CONF_IMC_PROCESS_GAIN, DEFAULT_IMC_PROCESS_GAIN))
+        tau = float(config.get(CONF_IMC_TIME_CONSTANT, DEFAULT_IMC_TIME_CONSTANT))
+        theta = float(config.get(CONF_IMC_DEAD_TIME, DEFAULT_IMC_DEAD_TIME) or 0.0)
         lam_raw = config.get(CONF_IMC_LAMBDA)
-        lam_f = float(lam_raw) if lam_raw is not None else tau
+        lam_f = float(lam_raw) if lam_raw is not None else float(DEFAULT_IMC_LAMBDA)
 
         if kp_proc <= 0 or tau <= 0 or lam_f <= 0 or (lam_f + theta) <= 0:
             raise ValueError(f"Invalid IMC parameters: Kp_proc={kp_proc}, tau={tau}, theta={theta}, lambda={lam_f}")
@@ -111,10 +112,16 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
 
         self._proportional_gain = kc
         self._integral_gain = ki
-        # Compute bleed rate from IMC time constant: bleed fully in ~3*tau
-        self._bleed_rate_per_s = 1.0 / (3.0 * tau)
-        _LOGGER.info("IMC tuning: Kc=%.6f, Ki=%.8f, bleed=%.6f/s (tau=%s s, theta=%s s, lambda=%s s, Kp_proc=%.4f, temp_range=%.2f)", self._proportional_gain,
-                     self._integral_gain, self._bleed_rate_per_s, tau, theta, lam_f, kp_proc, temp_range, )
+        _LOGGER.info(
+            "IMC tuning: Kc=%.6f, Ki=%.8f (tau=%s s, theta=%s s, lambda=%s s, Kp_proc=%.4f, temp_range=%.2f)",
+            self._proportional_gain,
+            self._integral_gain,
+            tau,
+            theta,
+            lam_f,
+            kp_proc,
+            temp_range,
+        )
 
         # State
         # Default to AUTO as standard mode
@@ -128,7 +135,6 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
         # Pending coalescing is not needed; we coalesce by skipping sends until interval
         # Controller integral state (IMC-PI)
         self._i_accum: float = 0.0  # integral over normalized error
-        self._prev_norm_error: float | None = None
         self._last_update_monotonic: float | None = None
 
         # Boost (HEAT) management
@@ -198,6 +204,18 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
         if abs(x) <= db:
             return 0.0
         return x - db if x > 0 else x + db
+
+    @staticmethod
+    def _snap_to_step(value: int, step: int, lo: int, hi: int) -> int:
+        """Round an integer to the nearest multiple of `step` and clamp to [lo, hi].
+
+        Expects step >= 1. Uses the class clamp helper to keep bounds consistent.
+        """
+        if step <= 1:
+            return int(SmartTRVClimate._clamp(int(value), lo, hi))
+        v = int(SmartTRVClimate._clamp(int(value), lo, hi))
+        snapped = int(round(v / step)) * step
+        return int(SmartTRVClimate._clamp(snapped, lo, hi))
 
     @property
     def min_temp(self) -> float:
@@ -462,10 +480,17 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
         return in_band, heat_side, cool_side
 
     def _update_integral(self, norm_error: float, heat_side: bool, cool_side: bool, dt: float | None, u_ff: float = 0.0) -> None:
-        """Integral separation and bleed behavior; updates _i_accum and _prev_norm_error.
+        """Integral separation and bleed behavior; updates internal integral state.
 
         Anti-windup: prevent integral growth when either the PI estimate or the
         actual clamped output (PI + FF) would exceed saturation (1.0).
+
+        Bleed behavior (in-band and cool-side):
+        - Instead of a fixed-rate bleed based on IMC tau, decay the integral
+          contribution `u_i` exponentially toward zero using the steady-state
+          decay time constant `self._decay_tau_s`. This aligns the in-band and
+          cool-side behavior and uses the same conceptual time base as the
+          output decay logic.
         """
         if dt is not None and dt > 0:
             u_p = self._proportional_gain * norm_error
@@ -479,12 +504,23 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
                 if u_pi_est < 1.0 and u_total_est < 1.0:
                     self._i_accum += norm_error * dt
             else:
-                # Cool side or in-band: gently bleed the integral to avoid lingering bias
-                delta = self._bleed_rate_per_s * dt
-                if not (delta > 0.0):
-                    delta = 1e-6
-                self._i_accum = max(0.0, self._i_accum - delta)
-        self._prev_norm_error = norm_error
+                # Cool side or in-band: exponentially decay the integral
+                # contribution u_i toward zero using the steady decay tau.
+                # Apply the same alpha helper used by output decay.
+                if self._decay_tau_s > 0:
+                    alpha = self._alpha(dt, self._decay_tau_s)
+                    # u_i_new = (1 - alpha) * u_i (toward 0)
+                    u_i_new = (1.0 - alpha) * u_i
+                    # Map back to internal accumulator (avoid division by 0)
+                    if self._integral_gain > 0.0:
+                        self._i_accum = max(0.0, u_i_new / self._integral_gain)
+                    else:
+                        # If Ki is zero (should not happen with valid IMC params), just zero it
+                        self._i_accum = 0.0
+                else:
+                    # If decay tau is invalid, fall back to immediate zeroing
+                    self._i_accum = 0.0
+        # Finished integral update
 
     def _compute_pi(self, norm_error: float) -> tuple[float, float]:
         """Compute PI output and integral contribution (u_pi, u_i). Updates diagnostics."""
@@ -687,6 +723,16 @@ class SmartTRVClimate(ClimateEntity, RestoreEntity):
 
         Note: external callers should use _async_request_valve_position.
         """
+        # Enforce minimum step size to reduce chattering at the TRV layer
+        try:
+            step = max(1, int(VALVE_MIN_STEP))
+        except Exception:
+            step = 5
+        # Clamp and optionally snap to step using existing helpers
+        if step > 1:
+            position = self._snap_to_step(int(position), step, VALVE_CLOSED_POSITION, VALVE_OPEN_POSITION)
+        else:
+            position = int(self._clamp(int(position), VALVE_CLOSED_POSITION, VALVE_OPEN_POSITION))
         
         # If requested equals last commanded, we may still need to resend selectively
         # to any underlying TRV whose actual does not match the target.
