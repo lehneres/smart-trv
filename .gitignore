@@ -1,0 +1,6 @@
+/tools/
+/.idea/
+*.csv
+*.json
+*.pyc
+*.pyo
